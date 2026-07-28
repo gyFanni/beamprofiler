@@ -12,6 +12,91 @@ from .models import FileEntry
 SAT_THRESH_DEFAULT = 0.8
 
 
+def load_bgdata(path: str, frame: int = 1) -> dict:
+    """
+    Load a BeamGage .bgData file (HDF5 format, Ophir/Spiricon).
+
+    Pixel data encoding
+    -------------------
+    BeamGage stores pixel values as signed 32-bit fixed-point integers where
+    the MSB of the camera's native N-bit data occupies bit position 30 (just
+    below the int32 sign bit). To recover ADC counts:
+
+        raw_counts = int32_value >> (30 - (N - 1))
+
+    BITENCODING is a string such as "8", "12", "S16", "U14" -- strip any
+    leading S/U prefix to get N.
+
+    Parameters
+    ----------
+    path  : path to the .bgData file
+    frame : 1-based frame index (default 1; most files contain a single frame)
+
+    Returns
+    -------
+    dict with keys:
+        image        : np.ndarray (float64), shape (height, width), ADC counts
+        bits         : int   -- native bit depth of the camera
+        pixel_size_x : float -- pixel pitch in x, micrometres
+        pixel_size_y : float -- pixel pitch in y, micrometres
+        width        : int
+        height       : int
+        timestamp    : str
+        saturated    : bool  -- BeamGage saturation flag
+        binning_x    : int
+        binning_y    : int
+        n_frames     : int   -- total number of frames in the file
+    """
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError(
+            "h5py is required to load .bgData files.\n"
+            "Install it with:  pip install h5py")
+
+    with h5py.File(path, "r") as f:
+        n_frames = len(f["BG_DATA"].keys())
+        grp = f[f"BG_DATA/{frame}"]
+        rf  = grp["RAWFRAME"]
+
+        w    = int(rf["WIDTH"][0])
+        h_px = int(rf["HEIGHT"][0])
+        px_x = float(rf["PIXELSCALEXUM"][0])
+        px_y = float(rf["PIXELSCALEYUM"][0])
+        bx   = int(rf["BINNINGX"][0])
+        by   = int(rf["BINNINGY"][0])
+        sat  = bool(rf["METADATA/SATURATED"][0])
+
+        ts_raw = rf["TIMESTAMP"][0]
+        ts = (ts_raw.decode() if isinstance(ts_raw, (bytes, np.bytes_))
+              else str(ts_raw))
+
+        bits_raw = rf["BITENCODING"][0]
+        bits_str = (bits_raw.decode() if isinstance(bits_raw, (bytes, np.bytes_))
+                    else str(bits_raw)).strip()
+        bits = int(bits_str.lstrip("SsUu"))
+
+        data = grp["DATA"][:]
+
+    # Fixed-point conversion: right-shift by (30 - (bits - 1))
+    shift = 30 - (bits - 1)
+    image = (data.astype(np.int64) >> shift).reshape(h_px, w).astype(float)
+
+    return dict(
+        image        = image,
+        bits         = bits,
+        pixel_size_x = px_x,
+        pixel_size_y = px_y,
+        width        = w,
+        height       = h_px,
+        timestamp    = ts,
+        saturated    = sat,
+        binning_x    = bx,
+        binning_y    = by,
+        n_frames     = n_frames,
+    )
+
+
 def check_saturation(img: np.ndarray, sat_thresh: float = SAT_THRESH_DEFAULT) -> dict:
     """
     Flag pixels at or above sat_thresh * ADC ceiling (default 80%).
@@ -145,24 +230,16 @@ def beam_size_iso(img: np.ndarray,
                   bg_std:  float = None,
                   n_sigma: float = 3.0,
                   mask_factor: float = 3.0,
-                  max_iter: int = 20) -> tuple[dict, np.ndarray, dict]:
+                  max_iter: int = 20,
+                  bg_subtract: bool = True) -> tuple[dict, np.ndarray, dict]:
     """
-    Integrated ISO 11146 beam size algorithm following the laserbeamsize approach.
+    Integrated ISO 11146 beam size algorithm.
 
-    img       : ROI crop of the sqrt-transformed, damage-corrected image
-    bg_mean   : background mean pre-estimated from the full image (recommended).
-                If None, estimated from img's own corners (less accurate for
-                small ROIs where corners may contain beam signal).
-    bg_std    : background std, paired with bg_mean. If None, estimated from img.
-
-    Pipeline
-    --------
-    1. Optional dark frame subtraction.
-    2. Subtract bg_mean. Zero pixels below n_sigma * bg_std.
-    3. Initial second moments on full zeroed image.
-    4. Iterative rotated-rectangle masking (ISO S.7, mask_factor = 3):
-       build mask of mask_factorxσ_maj x mask_factorxσ_min rotated by theta,
-       zero outside, recompute moments, repeat until convergence.
+    bg_subtract : if True (default), estimate and subtract the background,
+                  then zero pixels below n_sigma * bg_std.
+                  If False, skip subtraction entirely (e.g. when the camera
+                  already outputs background-free data). Only negative values
+                  from dark-frame subtraction are clamped to zero.
     """
     img = img.astype(float).copy()
 
@@ -172,18 +249,22 @@ def beam_size_iso(img: np.ndarray,
             raise ValueError(f"Dark frame shape {dark_frame.shape} != image {img.shape}.")
         img -= dark_frame.astype(float)
 
-    # use pre-estimated background or fall back to own corners
-    if bg_mean is None or bg_std is None:
-        _bg_mean, _bg_std = iso_background(img)
+    if bg_subtract:
+        # use pre-estimated background or fall back to own corners
+        if bg_mean is None or bg_std is None:
+            _bg_mean, _bg_std = iso_background(img)
+        else:
+            _bg_mean, _bg_std = float(bg_mean), float(bg_std)
+        img_bg    = img - _bg_mean
+        threshold = max(n_sigma * _bg_std, 0.0)
+        img_bg[img_bg < threshold] = 0.
+        bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=threshold,
+                       dark_used=dark_frame is not None, bg_subtract=True)
     else:
-        _bg_mean, _bg_std = float(bg_mean), float(bg_std)
-
-    img_bg    = img - _bg_mean
-    threshold = max(n_sigma * _bg_std, 0.0)
-    img_bg[img_bg < threshold] = 0.
-
-    bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=threshold,
-                   dark_used=dark_frame is not None)
+        # no background subtraction: clamp negatives only
+        img_bg  = np.maximum(img, 0.)
+        bg_info = dict(bg_mean=0., bg_std=0., threshold=0.,
+                       dark_used=dark_frame is not None, bg_subtract=False)
 
     # initial moments on full zeroed ROI
     m = _moments(img_bg, px)
@@ -445,6 +526,7 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
     use_tpa     = settings.get("use_tpa", True)
     dark_frame  = settings.get("dark_frame")
     sat_thresh  = settings.get("sat_thresh", SAT_THRESH_DEFAULT)
+    bg_subtract = settings.get("bg_subtract", True)
 
     sat = check_saturation(fe.clean_raw, sat_thresh=sat_thresh)
 
@@ -458,12 +540,16 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
                 if dark_frame is not None else None)
 
     # estimate background from the full image (not the small ROI crop)
-    # so corner patches are guaranteed to be real background
+    # so corner patches are guaranteed to be real background.
+    # Skip entirely when bg_subtract is disabled.
     corner_frac = settings.get("corner_frac", 0.035)
     n_sigma     = settings.get("n_sigma", 3.0)
-    bg_mean, bg_std = iso_background(fe.sqrt_img,
-                                     corner_frac=corner_frac,
-                                     n_sigma=n_sigma)
+    if bg_subtract:
+        bg_mean, bg_std = iso_background(fe.sqrt_img,
+                                         corner_frac=corner_frac,
+                                         n_sigma=n_sigma)
+    else:
+        bg_mean, bg_std = None, None
 
     m, bg_img, bg_info = beam_size_iso(
         roi_img,
@@ -473,6 +559,7 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         bg_std       = bg_std,
         n_sigma      = n_sigma,
         mask_factor  = settings.get("mask_factor", 3.0),
+        bg_subtract  = bg_subtract,
     )
 
     fe.roi_img = roi_img
@@ -497,6 +584,7 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         filename    = fe.fname,
         fit_mode    = fit_mode,
         use_tpa     = use_tpa,
+        bg_subtract = bg_subtract,
         unit        = unit,
         pixel_size_um = px,
         bg_info     = bg_info,

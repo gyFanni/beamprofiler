@@ -57,6 +57,15 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 from scipy.ndimage import label as _nd_label
+# Pre-import scipy.ndimage submodules and h5py at startup.
+# Both have a ~100-500 ms first-import cost (scipy.ndimage parses all
+# function docstrings; h5py loads HDF5 C libraries). Importing here
+# moves that cost to launch time rather than the first file open.
+import scipy.ndimage as _scipy_ndimage_preload   # noqa: F401
+try:
+    import h5py as _h5py_preload                 # noqa: F401
+except ImportError:
+    pass   # h5py is optional; missing it is caught gracefully in load_bgdata
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import (
@@ -92,6 +101,7 @@ from beamprofiler.analysis import (
     clip_level_widths,
     marginal_gaussian_fit,
     run_analysis,
+    load_bgdata,
 )
 
 # ========================================================================
@@ -411,7 +421,6 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("D4σ Beam Profiler  —  2-Photon Absorption")
-
         self.resize(1500, 860)
 
         self._files: list[FileEntry] = []
@@ -581,15 +590,20 @@ class MainWindow(QMainWindow):
         # 4 - Background
         grp_bg = CollapsibleSection("4  \u2014  Background (ISO 11146)")
         bl = grp_bg.layout()
-        bl.addWidget(QLabel(
-            "ISO method: corner seed -> unilluminated\n"
-            "pixel refinement -> subtract -> zero below\n"
-            "n*sigma -> rotated rect mask -> iterate."
-        ))
+
+        self.chk_bg_sub = QCheckBox("Enable background subtraction")
+        self.chk_bg_sub.setChecked(True)
+        self.chk_bg_sub.setToolTip(
+            "When checked: estimate background from corner patches,\n"
+            "subtract it, and zero pixels below n\u00b7\u03c3 (ISO 11146-3).\n"
+            "Uncheck to skip subtraction and work on the raw image directly.\n"
+            "Useful when the camera already outputs background-subtracted data.")
+        bl.addWidget(self.chk_bg_sub)
+
         sep_bg0 = QFrame(); sep_bg0.setFrameShape(QFrame.Shape.HLine); bl.addWidget(sep_bg0)
 
         # dark frame (optional)
-        self.btn_dark = QPushButton("📂 Load dark frame…")
+        self.btn_dark = QPushButton("\U0001f4c2 Load dark frame\u2026")
         self.lbl_dark = QLabel("No dark frame (optional).")
         self.lbl_dark.setStyleSheet("font-size: 9px; color:#7f849c;")
         self.lbl_dark.setWordWrap(True)
@@ -612,10 +626,10 @@ class MainWindow(QMainWindow):
         self.spin_nsig.setRange(1.0, 10.0); self.spin_nsig.setValue(3.0)
         self.spin_nsig.setSingleStep(0.5)
         self.spin_nsig.setToolTip(
-            "Pixels below n*sigma_bg after subtraction are set to zero.\n"
+            "Pixels below n\u00b7\u03c3_bg after subtraction are set to zero.\n"
             "Higher = more aggressive zeroing of background.\n"
             "Also used to identify unilluminated pixels.")
-        nsig_row.addWidget(QLabel("n·σ zero:")); nsig_row.addWidget(self.spin_nsig)
+        nsig_row.addWidget(QLabel("n\u00b7\u03c3 zero:")); nsig_row.addWidget(self.spin_nsig)
         bl.addLayout(nsig_row)
 
         mask_row = QHBoxLayout()
@@ -623,9 +637,9 @@ class MainWindow(QMainWindow):
         self.spin_mask_factor.setRange(1.0, 10.0); self.spin_mask_factor.setValue(3.0)
         self.spin_mask_factor.setSingleStep(0.5)
         self.spin_mask_factor.setToolTip(
-            "Rotated rectangle mask size = factor x D4sigma.\n"
+            "Rotated rectangle mask size = factor \u00d7 D4\u03c3.\n"
             "ISO 11146 specifies 3.0.")
-        mask_row.addWidget(QLabel("Mask (×D4σ):")); mask_row.addWidget(self.spin_mask_factor)
+        mask_row.addWidget(QLabel("Mask (\u00d7D4\u03c3):")); mask_row.addWidget(self.spin_mask_factor)
         bl.addLayout(mask_row)
 
         col_b.addWidget(grp_bg)
@@ -819,33 +833,62 @@ class MainWindow(QMainWindow):
 
     def _on_add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add CSV files", "",
-            "CSV files (*.csv *.txt *.dat);;All files (*)")
+            self, "Add image files", "",
+            "Image files (*.csv *.txt *.dat *.bgData *.bgdata);;"
+            "CSV files (*.csv *.txt *.dat);;"
+            "BeamGage files (*.bgData *.bgdata);;"
+            "All files (*)")
         if not paths:
             return
         added = 0
         for path in paths:
             if any(f.path == path for f in self._files):
-                continue  # skip duplicates
+                continue
             try:
-                raw = load_csv(path, self.chk_header.isChecked(), self.chk_index.isChecked())
+                raw, meta = self._load_image_file(path)
             except Exception as e:
                 QMessageBox.critical(self, "Load error", f"{os.path.basename(path)}: {e}")
                 continue
-            fe = FileEntry(path=path, raw=raw, clean_raw=raw.copy(), sqrt_img=self._tpa_transform(raw))
+
+            fe = FileEntry(path=path, raw=raw, clean_raw=raw.copy(),
+                           sqrt_img=self._tpa_transform(raw))
             self._files.append(fe)
             item = QListWidgetItem(fe.fname)
             item.setToolTip(path)
             self.lst_files.addItem(item)
             added += 1
 
+            # auto-populate pixel size and vmax from .bgData metadata
+            if meta:
+                if meta.get("pixel_size_x") and meta["pixel_size_x"] > 0:
+                    self.spin_px.setValue(meta["pixel_size_x"])
+                if meta.get("bits"):
+                    adc_ceiling = float(2 ** meta["bits"] - 1)
+                    self.spin_vmax.setValue(adc_ceiling)
+                if meta.get("is_bgdata"):
+                    self.chk_tpa.setChecked(False)
+
         if added:
             self.btn_run_all.setEnabled(True)
             self.btn_roi_auto_all.setEnabled(True)
-            # btn_roi_apply_all enabled only when current file has a ROI
             if self._current_idx < 0:
                 self.lst_files.setCurrentRow(0)
             self._status(f"Added {added} file(s). Total: {len(self._files)}")
+
+    def _load_image_file(self, path: str) -> tuple:
+        """
+        Load any supported image file. Returns (raw_array, metadata_dict).
+        metadata_dict is empty for CSV; contains pixel_size_x/bits/is_bgdata for .bgData.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".bgdata",):
+            info = load_bgdata(path, frame=1)
+            info["is_bgdata"] = True
+            return info["image"], info
+        else:
+            raw = load_csv(path, self.chk_header.isChecked(),
+                           self.chk_index.isChecked())
+            return raw, {}
 
     def _on_remove_file(self):
         row = self.lst_files.currentRow()
@@ -1083,11 +1126,12 @@ class MainWindow(QMainWindow):
     # -- dark frame ----------------------------------------------------
 
     def _on_load_dark(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open dark frame CSV", "",
-            "CSV files (*.csv *.txt *.dat);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open dark frame", "",
+            "Image files (*.csv *.txt *.dat *.bgData *.bgdata);;All files (*)")
         if not path: return
         try:
-            dark = load_csv(path, self.chk_header.isChecked(), self.chk_index.isChecked())
+            dark, _ = self._load_image_file(path)
         except Exception as e:
             QMessageBox.critical(self, "Dark frame load error", str(e)); return
         self._dark_frame = self._tpa_transform(dark)
@@ -1123,6 +1167,7 @@ class MainWindow(QMainWindow):
             use_auto_roi = self.chk_auto_roi_all.isChecked(),
             fit_mode     = fit_mode,
             use_tpa      = self.chk_tpa.isChecked(),
+            bg_subtract  = self.chk_bg_sub.isChecked(),
         )
 
     def _on_run(self):
@@ -1188,6 +1233,7 @@ class MainWindow(QMainWindow):
             f"  File            : {r.get('filename','')}",
             f"  Fit mode        : {fit_mode}",
             f"  TPA correction  : {'yes (\u221a transform)' if r.get('use_tpa', True) else 'no (linear)'}",
+            f"  BG subtraction  : {'yes (ISO 11146-3)' if r.get('bg_subtract', True) else 'no (disabled)'}",
             "-"*44,
             f"  Centroid x_bar     = {r['x_bar']:10.3f}  {unit}",
             f"  Centroid y_bar     = {r['y_bar']:10.3f}  {unit}",
@@ -1398,6 +1444,7 @@ class MainWindow(QMainWindow):
                 "filename":          r.get("filename", fe.fname),
                 "fit_mode":          r.get("fit_mode", "lab"),
                 "tpa_correction":    r.get("use_tpa", True),
+                "bg_subtraction":    r.get("bg_subtract", True),
                 "x_bar":             r["x_bar"],
                 "y_bar":             r["y_bar"],
                 "σ_x":           r["σ_x"],
