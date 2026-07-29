@@ -95,6 +95,7 @@ from beamprofiler.analysis import (
     apply_sqrt,
     check_saturation,
     iso_background,
+    iso_background_statistical,
     rotated_rect_mask,
     beam_size_iso,
     auto_roi,
@@ -238,7 +239,13 @@ class ResultsCanvas(FigureCanvas):
         # -- panel 1: sqrt ROI image ----------------------------------
         im1 = ax1.imshow(roi_img, origin="upper", cmap=cmap,
                          vmin=0, vmax=_vmax, interpolation="nearest", aspect="equal")
-        ax1.set_title("\u221a Image (ROI, before BG sub)", fontsize=8)
+        _p1_title = ("\u221a Image (ROI, TPA-corrected)" if use_tpa
+                     else "Raw ROI image (before BG sub)")
+        ax1.set_title(_p1_title, fontsize=8)
+        ax1.xaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda v, _: f"{v*px + x0_off:.0f}"))
+        ax1.yaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda v, _: f"{v*px + y0_off:.0f}"))
         ax1.set_xlabel(f"x [{unit}]"); ax1.set_ylabel(f"y [{unit}]")
         self.fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
@@ -591,14 +598,31 @@ class MainWindow(QMainWindow):
         grp_bg = CollapsibleSection("4  \u2014  Background (ISO 11146)")
         bl = grp_bg.layout()
 
-        self.chk_bg_sub = QCheckBox("Enable background subtraction")
-        self.chk_bg_sub.setChecked(True)
-        self.chk_bg_sub.setToolTip(
-            "When checked: estimate background from corner patches,\n"
-            "subtract it, and zero pixels below n\u00b7\u03c3 (ISO 11146-3).\n"
-            "Uncheck to skip subtraction and work on the raw image directly.\n"
-            "Useful when the camera already outputs background-subtracted data.")
-        bl.addWidget(self.chk_bg_sub)
+        bg_mode_row = QHBoxLayout()
+        bg_mode_row.addWidget(QLabel("Method:"))
+        self.combo_bg_mode = QComboBox()
+        self.combo_bg_mode.addItems([
+            "Off (no subtraction)",
+            "Corner estimate  (\u00a7\u200b3.4.3)",
+            "ISO statistical  (\u00a7\u200b3.4.2)",
+        ])
+        self.combo_bg_mode.setCurrentIndex(1)   # default: corner
+        self.combo_bg_mode.setToolTip(
+            "Off: skip background subtraction entirely.\n"
+            "\n"
+            "Corner estimate (ISO/TR 11146-3 \u00a73.4.3):\n"
+            "  Fast approximation. Corner patches seed the estimate;\n"
+            "  unilluminated pixels refine it. Pixels below n\u00b7\u03c3\n"
+            "  are zeroed after subtraction.\n"
+            "  Sufficient for beams < 0.5\u00d7 sensor size.\n"
+            "\n"
+            "ISO statistical (\u00a73.4.2, fully standard-compliant):\n"
+            "  2D local-mean convolution identifies illuminated pixels.\n"
+            "  Negatives are KEPT after subtraction as required by \u00a73.1\n"
+            "  so that positive and negative noise cancel in the integral.\n"
+            "  Recommended for small beams or high-accuracy measurements.")
+        bg_mode_row.addWidget(self.combo_bg_mode)
+        bl.addLayout(bg_mode_row)
 
         sep_bg0 = QFrame(); sep_bg0.setFrameShape(QFrame.Shape.HLine); bl.addWidget(sep_bg0)
 
@@ -617,19 +641,31 @@ class MainWindow(QMainWindow):
         self.spin_corner_pct.setSuffix(" %")
         self.spin_corner_pct.setToolTip(
             "Corner patch size as % of shorter image dimension.\n"
-            "Used as seed for the ISO background estimate.")
+            "Used by the corner-estimate method (\u00a73.4.3).\n"
+            "ISO recommends 2\u20135% of image size.")
         corner_row.addWidget(QLabel("Corner:")); corner_row.addWidget(self.spin_corner_pct)
         bl.addLayout(corner_row)
+
+        kernel_row = QHBoxLayout()
+        self.spin_kernel_pct = QDoubleSpinBox()
+        self.spin_kernel_pct.setRange(1.0, 10.0); self.spin_kernel_pct.setValue(3.0)
+        self.spin_kernel_pct.setSuffix(" %")
+        self.spin_kernel_pct.setToolTip(
+            "Convolution kernel size as % of shorter image dimension.\n"
+            "Used by the ISO statistical method (\u00a73.4.2).\n"
+            "ISO recommends 2\u20135% of image size.")
+        kernel_row.addWidget(QLabel("Kernel:")); kernel_row.addWidget(self.spin_kernel_pct)
+        bl.addLayout(kernel_row)
 
         nsig_row = QHBoxLayout()
         self.spin_nsig = QDoubleSpinBox()
         self.spin_nsig.setRange(1.0, 10.0); self.spin_nsig.setValue(3.0)
         self.spin_nsig.setSingleStep(0.5)
         self.spin_nsig.setToolTip(
-            "Pixels below n\u00b7\u03c3_bg after subtraction are set to zero.\n"
-            "Higher = more aggressive zeroing of background.\n"
-            "Also used to identify unilluminated pixels.")
-        nsig_row.addWidget(QLabel("n\u00b7\u03c3 zero:")); nsig_row.addWidget(self.spin_nsig)
+            "Threshold multiplier n\u1d57 (ISO \u00a73.4.2 specifies 2 < n\u1d57 < 4).\n"
+            "Corner method: pixels below n\u00b7\u03c3_bg are zeroed after subtraction.\n"
+            "ISO statistical method: used to identify illuminated pixels.")
+        nsig_row.addWidget(QLabel("n\u00b7\u03c3:")); nsig_row.addWidget(self.spin_nsig)
         bl.addLayout(nsig_row)
 
         mask_row = QHBoxLayout()
@@ -638,7 +674,7 @@ class MainWindow(QMainWindow):
         self.spin_mask_factor.setSingleStep(0.5)
         self.spin_mask_factor.setToolTip(
             "Rotated rectangle mask size = factor \u00d7 D4\u03c3.\n"
-            "ISO 11146 specifies 3.0.")
+            "ISO 11146-1 \u00a77 specifies 3.0.")
         mask_row.addWidget(QLabel("Mask (\u00d7D4\u03c3):")); mask_row.addWidget(self.spin_mask_factor)
         bl.addLayout(mask_row)
 
@@ -1157,17 +1193,21 @@ class MainWindow(QMainWindow):
     def _collect_settings(self) -> dict:
         fit_mode = ("lab" if self.combo_fit_mode.currentIndex() == 0
                     else "principal")
+        _bg_idx = self.combo_bg_mode.currentIndex()
+        bg_mode = ["off", "corner", "iso_statistical"][_bg_idx]
         return dict(
             px           = self.spin_px.value(),
             dark_frame   = self._dark_frame,
             corner_frac  = self.spin_corner_pct.value() / 100.0,
+            kernel_frac  = self.spin_kernel_pct.value() / 100.0,
             n_sigma      = self.spin_nsig.value(),
             mask_factor  = self.spin_mask_factor.value(),
             pad_sigma    = self.spin_pad_sigma.value(),
             use_auto_roi = self.chk_auto_roi_all.isChecked(),
             fit_mode     = fit_mode,
             use_tpa      = self.chk_tpa.isChecked(),
-            bg_subtract  = self.chk_bg_sub.isChecked(),
+            bg_subtract  = bg_mode != "off",
+            bg_mode      = bg_mode,
         )
 
     def _on_run(self):
@@ -1233,7 +1273,11 @@ class MainWindow(QMainWindow):
             f"  File            : {r.get('filename','')}",
             f"  Fit mode        : {fit_mode}",
             f"  TPA correction  : {'yes (\u221a transform)' if r.get('use_tpa', True) else 'no (linear)'}",
-            f"  BG subtraction  : {'yes (ISO 11146-3)' if r.get('bg_subtract', True) else 'no (disabled)'}",
+            ("  BG subtraction  : " + {
+                "off":            "disabled",
+                "corner":         "corner estimate (\u00a73.4.3)",
+                "iso_statistical":"ISO statistical (\u00a73.4.2)",
+            }.get(r.get("bg_mode","corner"), r.get("bg_mode","corner"))),
             "-"*44,
             f"  Centroid x_bar     = {r['x_bar']:10.3f}  {unit}",
             f"  Centroid y_bar     = {r['y_bar']:10.3f}  {unit}",
@@ -1342,7 +1386,13 @@ class MainWindow(QMainWindow):
                 _vmax_a   = float(np.sqrt(_vmax_raw)) if _use_tpa else float(_vmax_raw)
                 im1 = ax1.imshow(fe.roi_img, origin="upper", cmap=cmap,
                                  vmin=0, vmax=_vmax_a, interpolation="nearest", aspect="equal")
-                ax1.set_title("\u221a Image (ROI, before BG sub)", fontsize=8)
+                _p1t = ("\u221a Image (ROI, TPA-corrected)" if _use_tpa
+                        else "Raw ROI image (before BG sub)")
+                ax1.set_title(_p1t, fontsize=8)
+                ax1.xaxis.set_major_formatter(ticker.FuncFormatter(
+                    lambda v, _, _x0=x0_off, _px=px: f"{v*_px + _x0:.0f}"))
+                ax1.yaxis.set_major_formatter(ticker.FuncFormatter(
+                    lambda v, _, _y0=y0_off, _px=px: f"{v*_px + _y0:.0f}"))
                 ax1.set_xlabel(f"x [{unit}]"); ax1.set_ylabel(f"y [{unit}]")
                 fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
@@ -1444,7 +1494,7 @@ class MainWindow(QMainWindow):
                 "filename":          r.get("filename", fe.fname),
                 "fit_mode":          r.get("fit_mode", "lab"),
                 "tpa_correction":    r.get("use_tpa", True),
-                "bg_subtraction":    r.get("bg_subtract", True),
+                "bg_mode":           r.get("bg_mode", "corner"),
                 "x_bar":             r["x_bar"],
                 "y_bar":             r["y_bar"],
                 "σ_x":           r["σ_x"],
