@@ -134,10 +134,15 @@ def apply_sqrt(img: np.ndarray) -> np.ndarray:
 
 def iso_background(img: np.ndarray, corner_frac: float = 0.035, n_sigma: float = 3.0):
     """
-    Estimate background mean and std using the laserbeamsize ISO method:
-      1. Sample corners (corner_frac x min(ny,nx)) to get initial mean/std.
-      2. Label all pixels below mean + n_sigma*std as 'unilluminated'.
-      3. Recompute mean and std from those unilluminated pixels only.
+    Estimate background mean and std using the corner-patch approximation
+    (ISO/TR 11146-3 §3.4.3).
+
+    1. Sample corner patches (corner_frac x min(ny,nx) pixels each corner).
+    2. Identify all pixels below corner_mean + n_sigma*corner_std as unilluminated.
+    3. Recompute mean and std from those unilluminated pixels only.
+
+    This is the approximation method permitted by the standard as a first
+    estimate. It is fast and sufficient when beam width < 0.5 x sensor size.
 
     Returns (bg_mean, bg_std).
     """
@@ -148,11 +153,77 @@ def iso_background(img: np.ndarray, corner_frac: float = 0.035, n_sigma: float =
     c_mean = float(np.mean(corners))
     c_std  = float(np.std(corners))
 
-    # unilluminated mask: pixels below corner_mean + n_sigma*corner_std
     unlit = img[img < c_mean + n_sigma * c_std]
     if len(unlit) == 0:
         return c_mean, c_std
     return float(np.mean(unlit)), float(np.std(unlit))
+
+
+def iso_background_statistical(img: np.ndarray,
+                                n_sigma: float = 3.0,
+                                kernel_frac: float = 0.03) -> tuple[float, float]:
+    """
+    Fine baseline correction using the ISO/TR 11146-3 §3.4.2 statistical method.
+
+    Algorithm (following Eqs. 59-61 of the standard)
+    -------------------------------------------------
+    1. Compute a local mean image by convolving with a uniform kernel of
+       size n x m (kernel_frac x image size, practical range 2-5% per standard).
+       This averaging suppresses digitisation noise before thresholding.
+    2. Identify illuminated pixels: those where the local mean exceeds
+           E_offset + nT * E_std / sqrt((n+1)(m+1))
+       with nT = n_sigma (standard specifies 2 < nT < 4, default 3).
+    3. Non-illuminated pixels are everything else. Their mean is the baseline
+       offset to be subtracted.
+    4. Background std is estimated from the non-illuminated pixels.
+
+    Key difference from the corner-patch method
+    --------------------------------------------
+    - Negative values after subtraction are NOT zeroed. The standard (§3.1)
+      requires that negative noise values are kept in the integral so that
+      positive and negative noise amplitudes cancel in the second-moment sum.
+    - The convolution step avoids the digitisation artefact where a threshold
+      on integer-valued data always falls on a digit boundary.
+
+    Parameters
+    ----------
+    img         : full image (TPA-corrected if applicable)
+    n_sigma     : threshold multiplier nT (standard: 2 < nT < 4, default 3)
+    kernel_frac : kernel size as fraction of shorter image dimension (default 3%)
+
+    Returns
+    -------
+    (bg_mean, bg_std)
+    """
+    from scipy.ndimage import uniform_filter
+
+    ny, nx = img.shape
+    k = max(3, int(kernel_frac * min(ny, nx)))  # kernel side length, minimum 3
+
+    # Step 1: local mean via uniform filter (2D convolution with box kernel)
+    local_mean = uniform_filter(img.astype(float), size=k, mode='reflect')
+
+    # Initial guess for E_offset and E_std from corner patches
+    p = int(np.clip(0.035 * min(ny, nx), 5, 50))
+    corners = np.concatenate([img[:p,:p].ravel(), img[:p,-p:].ravel(),
+                               img[-p:,:p].ravel(), img[-p:,-p:].ravel()])
+    e_offset = float(np.mean(corners))
+    e_std    = float(np.std(corners))
+
+    # Step 2: identify illuminated pixels using the local mean (Eq. 61)
+    # threshold = E_offset + nT * E_std / sqrt((k+1)^2)
+    threshold = e_offset + n_sigma * e_std / float(k)
+    illuminated = local_mean > threshold
+
+    # Step 3: non-illuminated pixels give the refined baseline offset
+    non_illum = img[~illuminated]
+    if len(non_illum) < 10:
+        # fallback: use corners only
+        return e_offset, e_std
+
+    bg_mean = float(np.mean(non_illum))
+    bg_std  = float(np.std(non_illum))
+    return bg_mean, bg_std
 
 
 def rotated_rect_mask(ny: int, nx: int,
@@ -231,16 +302,26 @@ def beam_size_iso(img: np.ndarray,
                   n_sigma: float = 3.0,
                   mask_factor: float = 3.0,
                   max_iter: int = 20,
-                  bg_subtract: bool = True) -> tuple[dict, np.ndarray, dict]:
+                  bg_subtract: bool = True,
+                  bg_mode: str = "corner") -> tuple[dict, np.ndarray, dict]:
     """
     Integrated ISO 11146 beam size algorithm.
 
-    bg_subtract : if True (default), estimate and subtract the background,
-                  then zero pixels below n_sigma * bg_std.
-                  If False, skip subtraction entirely (e.g. when the camera
-                  already outputs background-free data). Only negative values
-                  from dark-frame subtraction are clamped to zero.
+    bg_mode : "off"      — no background subtraction; clamp negatives only
+              "corner"   — ISO/TR 11146-3 §3.4.3 corner-patch approximation
+                           (default; fast, works for most beams)
+              "iso_statistical" — ISO/TR 11146-3 §3.4.2 full statistical method
+                           with 2D local-mean convolution; negatives kept after
+                           subtraction as required by §3.1
+
+    bg_subtract is kept for backward compatibility (False maps to "off").
+    bg_mean / bg_std may be pre-computed by the caller for "corner" mode;
+    they are ignored in "iso_statistical" and "off" modes.
     """
+    # backward-compat: bg_subtract=False overrides bg_mode
+    if not bg_subtract:
+        bg_mode = "off"
+
     img = img.astype(float).copy()
 
     # dark frame subtraction
@@ -249,8 +330,25 @@ def beam_size_iso(img: np.ndarray,
             raise ValueError(f"Dark frame shape {dark_frame.shape} != image {img.shape}.")
         img -= dark_frame.astype(float)
 
-    if bg_subtract:
-        # use pre-estimated background or fall back to own corners
+    if bg_mode == "off":
+        img_bg  = np.maximum(img, 0.)
+        bg_info = dict(bg_mean=0., bg_std=0., threshold=0.,
+                       dark_used=dark_frame is not None,
+                       bg_mode="off", bg_subtract=False)
+
+    elif bg_mode == "iso_statistical":
+        # ISO/TR 11146-3 §3.4.2: 2D convolution + threshold on local mean.
+        # Negatives are KEPT after subtraction per §3.1.
+        _bg_mean, _bg_std = iso_background_statistical(img, n_sigma=n_sigma)
+        img_bg = img - _bg_mean
+        # Do NOT zero negatives — §3.1 requires them to cancel positive noise
+        # in the second-moment integral. Zero only outside the integration mask
+        # (handled in the iterative step below via rotated_rect_mask).
+        bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=0.,
+                       dark_used=dark_frame is not None,
+                       bg_mode="iso_statistical", bg_subtract=True)
+
+    else:  # "corner" (default)
         if bg_mean is None or bg_std is None:
             _bg_mean, _bg_std = iso_background(img)
         else:
@@ -259,12 +357,8 @@ def beam_size_iso(img: np.ndarray,
         threshold = max(n_sigma * _bg_std, 0.0)
         img_bg[img_bg < threshold] = 0.
         bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=threshold,
-                       dark_used=dark_frame is not None, bg_subtract=True)
-    else:
-        # no background subtraction: clamp negatives only
-        img_bg  = np.maximum(img, 0.)
-        bg_info = dict(bg_mean=0., bg_std=0., threshold=0.,
-                       dark_used=dark_frame is not None, bg_subtract=False)
+                       dark_used=dark_frame is not None,
+                       bg_mode="corner", bg_subtract=True)
 
     # initial moments on full zeroed ROI
     m = _moments(img_bg, px)
@@ -527,6 +621,12 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
     dark_frame  = settings.get("dark_frame")
     sat_thresh  = settings.get("sat_thresh", SAT_THRESH_DEFAULT)
     bg_subtract = settings.get("bg_subtract", True)
+    # bg_mode: "off" | "corner" | "iso_statistical"
+    # if old-style bg_subtract=False, map to "off"
+    if not bg_subtract:
+        bg_mode = "off"
+    else:
+        bg_mode = settings.get("bg_mode", "corner")
 
     sat = check_saturation(fe.clean_raw, sat_thresh=sat_thresh)
 
@@ -539,15 +639,22 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
     dark_roi = (dark_frame[y0:y1, x0:x1]
                 if dark_frame is not None else None)
 
-    # estimate background from the full image (not the small ROI crop)
-    # so corner patches are guaranteed to be real background.
-    # Skip entirely when bg_subtract is disabled.
-    corner_frac = settings.get("corner_frac", 0.035)
-    n_sigma     = settings.get("n_sigma", 3.0)
-    if bg_subtract:
+    corner_frac  = settings.get("corner_frac", 0.035)
+    n_sigma      = settings.get("n_sigma", 3.0)
+    kernel_frac  = settings.get("kernel_frac", 0.03)
+
+    # pre-estimate background from full image for "corner" mode
+    # (corners of the full sensor are guaranteed to be background)
+    if bg_mode == "corner":
         bg_mean, bg_std = iso_background(fe.sqrt_img,
                                          corner_frac=corner_frac,
                                          n_sigma=n_sigma)
+    elif bg_mode == "iso_statistical":
+        # statistical method operates on the ROI so it can use the full
+        # local variance information; full-image call also acceptable
+        bg_mean, bg_std = iso_background_statistical(fe.sqrt_img,
+                                                     n_sigma=n_sigma,
+                                                     kernel_frac=kernel_frac)
     else:
         bg_mean, bg_std = None, None
 
@@ -560,6 +667,7 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         n_sigma      = n_sigma,
         mask_factor  = settings.get("mask_factor", 3.0),
         bg_subtract  = bg_subtract,
+        bg_mode      = bg_mode,
     )
 
     fe.roi_img = roi_img
@@ -585,6 +693,7 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         fit_mode    = fit_mode,
         use_tpa     = use_tpa,
         bg_subtract = bg_subtract,
+        bg_mode     = bg_mode,
         unit        = unit,
         pixel_size_um = px,
         bg_info     = bg_info,
