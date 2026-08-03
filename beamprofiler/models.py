@@ -19,11 +19,10 @@ class FileEntry:
     path:       str
     raw:        np.ndarray           # original pixel data as loaded
     clean_raw:  np.ndarray           # raw with damage regions replaced by bg mean
-    sqrt_img:   np.ndarray           # TPA-corrected (or raw copy if TPA disabled)
     roi:        Optional[tuple]      = None   # (x0, x1, y0, y1) pixel indices
     dmask:      Optional[np.ndarray] = None   # bool mask, True = damaged pixel
-    roi_img:    Optional[np.ndarray] = None   # sqrt_img cropped to ROI
-    bg_img:     Optional[np.ndarray] = None   # background-subtracted & masked
+    roi_img:    Optional[np.ndarray] = None   # clean_raw cropped to ROI (for display)
+    bg_img:     Optional[np.ndarray] = None   # background-subtracted & TPA-corrected
     bg_info:    dict = field(default_factory=dict)
     results:    dict = field(default_factory=dict)
 
