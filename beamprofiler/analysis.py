@@ -97,12 +97,21 @@ def load_bgdata(path: str, frame: int = 1) -> dict:
     )
 
 
-def check_saturation(img: np.ndarray, sat_thresh: float = SAT_THRESH_DEFAULT) -> dict:
+def check_saturation(img: np.ndarray,
+                     sat_thresh: float = SAT_THRESH_DEFAULT,
+                     adc_ceiling: float = None) -> dict:
     """
-    Flag pixels at or above sat_thresh * ADC ceiling (default 80%).
+    Flag pixels at or above sat_thresh * adc_ceiling (default 80%).
+
+    adc_ceiling should be the hardware ADC maximum (e.g. 255 for 8-bit,
+    65535 for 16-bit). If not provided it falls back to img.max(), but
+    this will always trigger a warning since the brightest pixel is by
+    definition 100% of the inferred ceiling — pass the true hardware
+    ceiling wherever possible.
+
     Returns: warning, sat_fraction, n_sat, adc_ceiling, threshold, message.
     """
-    ceiling   = float(img.max())
+    ceiling   = float(adc_ceiling) if adc_ceiling is not None else float(img.max())
     threshold = sat_thresh * ceiling
     n_sat     = int((img >= threshold).sum())
     sat_frac  = float(n_sat) / img.size
@@ -303,52 +312,52 @@ def beam_size_iso(img: np.ndarray,
                   mask_factor: float = 3.0,
                   max_iter: int = 20,
                   bg_subtract: bool = True,
-                  bg_mode: str = "corner") -> tuple[dict, np.ndarray, dict]:
+                  bg_mode: str = "corner",
+                  use_tpa: bool = False) -> tuple[dict, np.ndarray, dict]:
     """
     Integrated ISO 11146 beam size algorithm.
 
-    bg_mode : "off"      — no background subtraction; clamp negatives only
-              "corner"   — ISO/TR 11146-3 §3.4.3 corner-patch approximation
-                           (default; fast, works for most beams)
+    bg_mode : "off"             — no background subtraction
+              "corner"          — ISO/TR 11146-3 §3.4.3 corner-patch approximation
               "iso_statistical" — ISO/TR 11146-3 §3.4.2 full statistical method
-                           with 2D local-mean convolution; negatives kept after
-                           subtraction as required by §3.1
+
+    use_tpa : if True, apply sign(x)*sqrt(|x|) AFTER background subtraction.
+              This is the correct order for TPA cameras:
+                1. Subtract background in raw ADC domain (S_corr = S_raw - B)
+                2. sqrt: I = sign(S_corr) * sqrt(|S_corr|)
+              The sign-preserving sqrt handles negative residuals from noise
+              without discarding them, allowing compensation in the integral.
 
     bg_subtract is kept for backward compatibility (False maps to "off").
-    bg_mean / bg_std may be pre-computed by the caller for "corner" mode;
-    they are ignored in "iso_statistical" and "off" modes.
+    bg_mean / bg_std may be pre-computed by the caller for "corner" mode.
     """
-    # backward-compat: bg_subtract=False overrides bg_mode
     if not bg_subtract:
         bg_mode = "off"
 
     img = img.astype(float).copy()
 
-    # dark frame subtraction
+    # Step 1: dark frame subtraction (always in raw ADC domain)
     if dark_frame is not None:
         if dark_frame.shape != img.shape:
             raise ValueError(f"Dark frame shape {dark_frame.shape} != image {img.shape}.")
         img -= dark_frame.astype(float)
 
+    # Step 2: background subtraction (in raw ADC domain)
     if bg_mode == "off":
-        img_bg  = np.maximum(img, 0.)
+        img_bg  = img.copy()
         bg_info = dict(bg_mean=0., bg_std=0., threshold=0.,
                        dark_used=dark_frame is not None,
                        bg_mode="off", bg_subtract=False)
 
     elif bg_mode == "iso_statistical":
-        # ISO/TR 11146-3 §3.4.2: 2D convolution + threshold on local mean.
-        # Negatives are KEPT after subtraction per §3.1.
         _bg_mean, _bg_std = iso_background_statistical(img, n_sigma=n_sigma)
         img_bg = img - _bg_mean
-        # Do NOT zero negatives — §3.1 requires them to cancel positive noise
-        # in the second-moment integral. Zero only outside the integration mask
-        # (handled in the iterative step below via rotated_rect_mask).
+        # keep negatives — §3.1 requires them
         bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=0.,
                        dark_used=dark_frame is not None,
                        bg_mode="iso_statistical", bg_subtract=True)
 
-    else:  # "corner" (default)
+    else:  # "corner"
         if bg_mean is None or bg_std is None:
             _bg_mean, _bg_std = iso_background(img)
         else:
@@ -359,6 +368,14 @@ def beam_size_iso(img: np.ndarray,
         bg_info = dict(bg_mean=_bg_mean, bg_std=_bg_std, threshold=threshold,
                        dark_used=dark_frame is not None,
                        bg_mode="corner", bg_subtract=True)
+
+    # Step 3: TPA correction — sqrt AFTER background subtraction.
+    # sign(x)*sqrt(|x|) preserves the sign of negative residuals so they
+    # can cancel positive noise in the second-moment integral.
+    # For "corner" mode negatives were already zeroed above, so no negatives
+    # survive to the sqrt; for "iso_statistical" and "off" negatives are kept.
+    if use_tpa:
+        img_bg = apply_sqrt(img_bg)
 
     # initial moments on full zeroed ROI
     m = _moments(img_bg, px)
@@ -611,53 +628,66 @@ def auto_roi(img, pad_sigma=3.0, max_iter=20):
 
 def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
     """
-    Run the full pipeline on a FileEntry using the provided settings dict.
-    Settings keys: dark_frame, corner_frac, n_sigma, mask_factor, px,
-                   pad_sigma, use_auto_roi, fit_mode ('lab' | 'principal').
+    Run the full ISO 11146 pipeline on a FileEntry.
+
+    Pipeline order
+    --------------
+    1. Saturation check (on raw ADC values)
+    2. Auto-ROI if needed (on clean_raw ADC values)
+    3. Crop ROI from clean_raw  -> fe.roi_img  (raw ADC, for display)
+    4. Inside beam_size_iso:
+         a. Dark frame subtraction (ADC domain)
+         b. Background subtraction (ADC domain)
+         c. TPA sqrt correction if use_tpa=True  (AFTER background)
+         d. Iterative second-moment masking
+    5. Clip-level widths on the processed image
     """
     px          = settings["px"]
     fit_mode    = settings.get("fit_mode", "lab")
     use_tpa     = settings.get("use_tpa", True)
     dark_frame  = settings.get("dark_frame")
     sat_thresh  = settings.get("sat_thresh", SAT_THRESH_DEFAULT)
+    adc_ceiling = settings.get("adc_ceiling", None)
     bg_subtract = settings.get("bg_subtract", True)
-    # bg_mode: "off" | "corner" | "iso_statistical"
-    # if old-style bg_subtract=False, map to "off"
     if not bg_subtract:
         bg_mode = "off"
     else:
         bg_mode = settings.get("bg_mode", "corner")
 
-    sat = check_saturation(fe.clean_raw, sat_thresh=sat_thresh)
+    # Step 1: saturation check against the hardware ADC ceiling
+    sat = check_saturation(fe.clean_raw, sat_thresh=sat_thresh,
+                           adc_ceiling=adc_ceiling)
 
-    # use existing ROI or compute auto-ROI
+    # Step 2: ROI — auto or use existing; operates on clean_raw (ADC domain)
     if fe.roi is None or settings.get("use_auto_roi", False):
-        fe.roi = auto_roi(fe.sqrt_img, pad_sigma=settings["pad_sigma"])
+        fe.roi = auto_roi(fe.clean_raw, pad_sigma=settings["pad_sigma"])
 
     x0, x1, y0, y1 = fe.roi
-    roi_img  = fe.sqrt_img[y0:y1, x0:x1]
+
+    # Step 3: crop raw ROI for display and for analysis input
+    roi_img  = fe.clean_raw[y0:y1, x0:x1].astype(float)   # raw ADC, for display
     dark_roi = (dark_frame[y0:y1, x0:x1]
                 if dark_frame is not None else None)
 
-    corner_frac  = settings.get("corner_frac", 0.035)
-    n_sigma      = settings.get("n_sigma", 3.0)
-    kernel_frac  = settings.get("kernel_frac", 0.03)
+    corner_frac = settings.get("corner_frac", 0.035)
+    n_sigma     = settings.get("n_sigma", 3.0)
+    kernel_frac = settings.get("kernel_frac", 0.03)
 
-    # pre-estimate background from full image for "corner" mode
-    # (corners of the full sensor are guaranteed to be background)
+    # Pre-estimate background from the FULL clean_raw image in ADC domain.
+    # Corners of the full sensor are guaranteed to be background.
     if bg_mode == "corner":
-        bg_mean, bg_std = iso_background(fe.sqrt_img,
+        bg_mean, bg_std = iso_background(fe.clean_raw,
                                          corner_frac=corner_frac,
                                          n_sigma=n_sigma)
     elif bg_mode == "iso_statistical":
-        # statistical method operates on the ROI so it can use the full
-        # local variance information; full-image call also acceptable
-        bg_mean, bg_std = iso_background_statistical(fe.sqrt_img,
+        bg_mean, bg_std = iso_background_statistical(fe.clean_raw,
                                                      n_sigma=n_sigma,
                                                      kernel_frac=kernel_frac)
     else:
         bg_mean, bg_std = None, None
 
+    # Step 4: beam_size_iso handles dark subtraction, BG subtraction,
+    # TPA sqrt (in correct order), and iterative moment masking.
     m, bg_img, bg_info = beam_size_iso(
         roi_img,
         px           = px,
@@ -668,15 +698,17 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         mask_factor  = settings.get("mask_factor", 3.0),
         bg_subtract  = bg_subtract,
         bg_mode      = bg_mode,
+        use_tpa      = use_tpa,
     )
 
+    # roi_img stored for display (raw ADC, no sqrt)
     fe.roi_img = roi_img
-    fe.bg_img  = bg_img
+    fe.bg_img  = bg_img   # background-subtracted + TPA-corrected (for display)
     fe.bg_info = bg_info
 
-    unit = "µm" if px != 1.0 else "px"
+    unit = "\u00b5m" if px != 1.0 else "px"
 
-    # clip-level widths: lab axes always; principal axes when theta != 0
+    # Step 5: clip-level widths on the processed image
     cl = clip_level_widths(
         bg_img, px=px, clip_frac=0.135,
         theta_rad = m["theta_rad"],
@@ -684,7 +716,6 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         yc_px     = m["y_bar"] / px if px else m["y_bar"],
     )
 
-    # shift centroid to global coordinates
     x_bar_g = m["x_bar"] + x0 * px
     y_bar_g = m["y_bar"] + y0 * px
 
@@ -698,23 +729,23 @@ def run_analysis(fe: FileEntry, settings: dict) -> FileEntry:
         pixel_size_um = px,
         bg_info     = bg_info,
         roi         = fe.roi,
-        # centroid (global)
+        saturation_warning = sat["warning"],
+        sat_fraction       = sat["sat_fraction"],
+        n_sat              = sat["n_sat"],
+        sat_message        = sat["message"],
         x_bar       = x_bar_g,
         y_bar       = y_bar_g,
-        # lab-axis moments
         σ_x     = m["sigma_x"],
         σ_y     = m["sigma_y"],
         σ_xy    = m["sigma_xy"],
         d4σ_x   = m["d4sigma_x"],
         d4σ_y   = m["d4sigma_y"],
-        # principal-axis moments
         σ_maj   = m["sigma_maj"],
         σ_min   = m["sigma_min"],
         d4σ_maj = m["d4sigma_maj"],
         d4σ_min = m["d4sigma_min"],
         θ_deg   = m["theta_deg"],
         ellipticity = m["ellipticity"],
-        # clip-level
         clip_x      = cl["clip_x"],
         clip_y      = cl["clip_y"],
         clip_maj    = cl["clip_maj"],

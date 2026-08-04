@@ -228,20 +228,20 @@ class ResultsCanvas(FigureCanvas):
         x_ax = np.arange(nx) * px + x0_off
         y_ax = np.arange(ny) * px + y0_off
 
-        # colour ceiling for analysis panels:
-        #   TPA on  -> sqrt(ADC ceiling)  e.g. sqrt(255) ~ 15.97
-        #   TPA off -> ADC ceiling        e.g. 255
-        if vmax_raw is not None:
-            _vmax = float(np.sqrt(vmax_raw)) if use_tpa else float(vmax_raw)
-        else:
-            _vmax = float(np.percentile(roi_img, 99.5)) or 1.0
+        # Panel 1 shows raw ADC values (roi_img = clean_raw crop, no sqrt).
+        # Panel 2 shows bg_img = background-subtracted + TPA-corrected.
+        # Their colour ceilings are therefore different:
+        #   panel 1: always vmax_raw (ADC ceiling, e.g. 255)
+        #   panel 2: sqrt(vmax_raw) if TPA on, else vmax_raw
+        _vmax_p1 = float(vmax_raw) if vmax_raw is not None else (
+            float(np.percentile(roi_img, 99.5)) or 1.0)
+        _vmax_p2 = (float(np.sqrt(vmax_raw)) if (use_tpa and vmax_raw is not None)
+                    else _vmax_p1)
 
-        # -- panel 1: sqrt ROI image ----------------------------------
+        # -- panel 1: raw ROI image (no BG sub, no sqrt) ---------------
         im1 = ax1.imshow(roi_img, origin="upper", cmap=cmap,
-                         vmin=0, vmax=_vmax, interpolation="nearest", aspect="equal")
-        _p1_title = ("\u221a Image (ROI, TPA-corrected)" if use_tpa
-                     else "Raw ROI image (before BG sub)")
-        ax1.set_title(_p1_title, fontsize=8)
+                         vmin=0, vmax=_vmax_p1, interpolation="nearest", aspect="equal")
+        ax1.set_title("Raw ROI image (before BG sub)", fontsize=8)
         ax1.xaxis.set_major_formatter(ticker.FuncFormatter(
             lambda v, _: f"{v*px + x0_off:.0f}"))
         ax1.yaxis.set_major_formatter(ticker.FuncFormatter(
@@ -249,10 +249,9 @@ class ResultsCanvas(FigureCanvas):
         ax1.set_xlabel(f"x [{unit}]"); ax1.set_ylabel(f"y [{unit}]")
         self.fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-        # -- panel 2: BG-subtracted + ellipse ---------------------
-        # Same colour ceiling as panel 1 for a consistent scale.
+        # -- panel 2: BG-subtracted + TPA-corrected + ellipse ----------
         im2 = ax2.imshow(bg_img, origin="upper", cmap=cmap,
-                         vmin=0, vmax=_vmax, interpolation="nearest", aspect="equal")
+                         vmin=0, vmax=_vmax_p2, interpolation="nearest", aspect="equal")
 
         # centroid in ROI-local pixel coords
         cx_px = (r["x_bar"] - x0_off) / px if px else (r["x_bar"] - x0_off)
@@ -845,16 +844,8 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self._on_save)
         self.btn_save_series.clicked.connect(self._on_save_series)
 
-    def _tpa_transform(self, img: np.ndarray) -> np.ndarray:
-        """Apply sqrt transform if TPA checkbox is checked, else return copy."""
-        if self.chk_tpa.isChecked():
-            return apply_sqrt(img)
-        return img.astype(float).copy()
-
     def _on_tpa_changed(self):
-        """Recompute sqrt_img for every loaded file when TPA toggle changes."""
-        for fe in self._files:
-            fe.sqrt_img = self._tpa_transform(fe.clean_raw)
+        """TPA toggle changed: re-run analysis to apply the corrected pipeline."""
         self._refresh_image_view()
         self._status("TPA correction " +
                      ("enabled" if self.chk_tpa.isChecked() else "disabled") +
@@ -886,8 +877,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Load error", f"{os.path.basename(path)}: {e}")
                 continue
 
-            fe = FileEntry(path=path, raw=raw, clean_raw=raw.copy(),
-                           sqrt_img=self._tpa_transform(raw))
+            fe = FileEntry(path=path, raw=raw, clean_raw=raw.copy())
             self._files.append(fe)
             item = QListWidgetItem(fe.fname)
             item.setToolTip(path)
@@ -1012,7 +1002,7 @@ class MainWindow(QMainWindow):
         self._status("Running auto-ROI ...")
         QApplication.processEvents()
         try:
-            roi = auto_roi(fe.sqrt_img, pad_sigma=self.spin_pad_sigma.value())
+            roi = auto_roi(fe.clean_raw, pad_sigma=self.spin_pad_sigma.value())
         except Exception as e:
             QMessageBox.critical(self, "Auto-ROI error", str(e)); return
         fe.roi = roi
@@ -1046,7 +1036,7 @@ class MainWindow(QMainWindow):
         self.img_canvas.disable_roi_selector()
         fe = self._fe
         if fe is None: return
-        ny, nx = fe.sqrt_img.shape
+        ny, nx = fe.clean_raw.shape
         x0=max(0,x0); x1=min(nx,x1); y0=max(0,y0); y1=min(ny,y1)
         if x1-x0 < 2 or y1-y0 < 2: return
         fe.roi = (x0,x1,y0,y1)
@@ -1083,7 +1073,6 @@ class MainWindow(QMainWindow):
         if fe.dmask is None:
             fe.dmask = np.zeros((ny, nx), dtype=bool)
         fe.dmask[y0:y1, x0:x1] = True
-        fe.sqrt_img = self._tpa_transform(fe.clean_raw)
         n_px = int(fe.dmask.sum())
         self.lbl_dmg.setText(f"{n_px} px masked  (bg={bg_mean:.1f}, thr<{thr:.0f})")
         self.btn_dmg_clear.setEnabled(True)
@@ -1103,7 +1092,7 @@ class MainWindow(QMainWindow):
             prog.setLabelText(f"{fe.fname}  ({i+1}/{len(self._files)})")
             QApplication.processEvents()
             try:
-                fe.roi = auto_roi(fe.sqrt_img, pad_sigma=pad)
+                fe.roi = auto_roi(fe.clean_raw, pad_sigma=pad)
             except Exception as e:
                 self._status(f"Auto-ROI failed for {fe.fname}: {e}")
             prog.setValue(i+1)
@@ -1142,7 +1131,7 @@ class MainWindow(QMainWindow):
                           if (other.raw < thr).any() else 0.0
                 other.clean_raw[y0c:y1c, x0c:x1c] = bg_mean
                 other.dmask[y0c:y1c, x0c:x1c]     = True
-            other.sqrt_img = self._tpa_transform(other.clean_raw)
+
             n_applied += 1
 
         # refresh display
@@ -1153,7 +1142,6 @@ class MainWindow(QMainWindow):
         fe = self._fe
         if fe is None: return
         fe.clean_raw = fe.raw.copy()
-        fe.sqrt_img  = self._tpa_transform(fe.clean_raw)
         fe.dmask     = None
         self.lbl_dmg.setText("No damage marked.")
         self.btn_dmg_clear.setEnabled(False)
@@ -1170,7 +1158,7 @@ class MainWindow(QMainWindow):
             dark, _ = self._load_image_file(path)
         except Exception as e:
             QMessageBox.critical(self, "Dark frame load error", str(e)); return
-        self._dark_frame = self._tpa_transform(dark)
+        self._dark_frame = dark.astype(float)
         self.lbl_dark.setText(f"Dark: {os.path.basename(path)}")
         self._status(f"Dark frame loaded: {os.path.basename(path)}")
 
@@ -1208,6 +1196,7 @@ class MainWindow(QMainWindow):
             use_tpa      = self.chk_tpa.isChecked(),
             bg_subtract  = bg_mode != "off",
             bg_mode      = bg_mode,
+            adc_ceiling  = self.spin_vmax.value(),
         )
 
     def _on_run(self):
@@ -1380,15 +1369,14 @@ class MainWindow(QMainWindow):
                 ax3 = fig.add_subplot(gs[1, 0])
                 ax4 = fig.add_subplot(gs[1, 1])
 
-                # panel 1
+                # panel 1: raw ROI (clean_raw crop, no sqrt, no BG sub)
                 _vmax_raw = self.spin_vmax.value()
                 _use_tpa  = r.get("use_tpa", True)
-                _vmax_a   = float(np.sqrt(_vmax_raw)) if _use_tpa else float(_vmax_raw)
+                _vmax_p1  = float(_vmax_raw)
+                _vmax_p2  = float(np.sqrt(_vmax_raw)) if _use_tpa else float(_vmax_raw)
                 im1 = ax1.imshow(fe.roi_img, origin="upper", cmap=cmap,
-                                 vmin=0, vmax=_vmax_a, interpolation="nearest", aspect="equal")
-                _p1t = ("\u221a Image (ROI, TPA-corrected)" if _use_tpa
-                        else "Raw ROI image (before BG sub)")
-                ax1.set_title(_p1t, fontsize=8)
+                                 vmin=0, vmax=_vmax_p1, interpolation="nearest", aspect="equal")
+                ax1.set_title("Raw ROI image (before BG sub)", fontsize=8)
                 ax1.xaxis.set_major_formatter(ticker.FuncFormatter(
                     lambda v, _, _x0=x0_off, _px=px: f"{v*_px + _x0:.0f}"))
                 ax1.yaxis.set_major_formatter(ticker.FuncFormatter(
@@ -1396,9 +1384,9 @@ class MainWindow(QMainWindow):
                 ax1.set_xlabel(f"x [{unit}]"); ax1.set_ylabel(f"y [{unit}]")
                 fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-                # panel 2
+                # panel 2: BG-subtracted + TPA-corrected
                 im2 = ax2.imshow(fe.bg_img, origin="upper", cmap=cmap,
-                                 vmin=0, vmax=_vmax_a, interpolation="nearest", aspect="equal")
+                                 vmin=0, vmax=_vmax_p2, interpolation="nearest", aspect="equal")
                 cx_px = (r["x_bar"] - x0_off) / px if px else (r["x_bar"] - x0_off)
                 cy_px = (r["y_bar"] - y0_off) / px if px else (r["y_bar"] - y0_off)
                 ax2.plot(cx_px, cy_px, "+", color="white", ms=12, mew=2, label="centroid")
@@ -1544,10 +1532,8 @@ class MainWindow(QMainWindow):
     def _refresh_image_view(self):
         fe = self._fe
         if fe is None: return
-        # only redraw image canvas when image page is active
         if self._stack.currentIndex() != 0:
             return
-        view  = self.combo_view.currentText()
         cmap  = self.combo_cmap.currentText()
         unit  = "\u00b5m" if self.spin_px.value() != 1.0 else "px"
         img   = fe.clean_raw
