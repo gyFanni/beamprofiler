@@ -11,7 +11,7 @@ A Python desktop application for ISO 11146-compliant laser beam profiling from c
 
 - **ISO 11146-1 second-moment analysis** — centroid, σ_x, σ_y, D4σ_x, D4σ_y, and full tensor diagonalisation for principal axes (σ_maj, σ_min, θ, ellipticity)
 - **Iterative integration-area masking** — ISO 11146-1 §7 rotated-rectangle mask converged to 3σ
-- **Background subtraction** — corner-seed approximation method (ISO/TR 11146-3 §3.4.3); optional, can be disabled for cameras that output pre-subtracted data
+- **Background subtraction** — three modes: disabled; corner-seed approximation (ISO/TR 11146-3 §3.4.3); full ISO statistical method (§3.4.2) with 2D local-mean convolution and negative values retained per §3.1
 - **TPA correction** — optional sign(x)·√|x| transform for two-photon-absorption cameras; toggleable per-session
 - **Clip-level (D%pk) widths** — BeamGage-style 13.5% (1/e²) widths from marginal profiles, in both lab and principal axes
 - **Robust auto-ROI** — Gaussian-blur + flat-region suppression for reliable beam finding even with saturated damage clusters present, followed by ISO §7 iterative seed refinement
@@ -162,7 +162,7 @@ Multi-frame files are supported; frame 1 is loaded by default.
 |---|---|---|
 | Pixel size | 1.0 µm | Camera pixel pitch. Auto-set from .bgData metadata. |
 | TPA correction | on | Apply sign(x)·√\|x\| before analysis. Auto-off for .bgData. |
-| BG subtraction | on | Estimate and subtract background (ISO/TR 11146-3 §3.4.3). |
+| BG subtraction | Corner §3.4.3 | Three modes: disabled; corner §3.4.3 (fast, pragmatic); ISO statistical §3.4.2 (fully compliant, recommended). |
 | Fit mode | Lab axes | Lab (σ_x, σ_y) or Principal axes (σ_maj, σ_min, θ). |
 | vmax | 255 | Colour scale ceiling for the raw image viewer. Auto-set from .bgData bit depth. |
 | Corner fraction | 3.5% | Size of corner patches for background estimation (2–5% per ISO §3.4.3). |
@@ -193,13 +193,13 @@ $$\varphi = \frac{1}{2}\arctan\!\left(\frac{2\sigma_{xy}}{\sigma_x^2-\sigma_y^2}
 
 ### Known deviations from ISO/TR 11146-3
 
-The background correction procedure deviates from the standard in two ways, both following the approach of the laserbeamsize library:
+The background correction procedure differs from the standard depending on which method is selected:
 
-**1. Negative noise values (§3.1)**
-The standard requires that negative values remaining after background subtraction are kept in the integral, so that positive and negative noise amplitudes cancel. The current implementation zeros pixels below `n·σ_bg`, which introduces a small positive bias in σ for low-SNR measurements. This is a known pragmatic deviation; it has negligible effect when beam width > 0.25× sensor size.
+**Corner method (§3.4.3) — partial deviation**
+Pixels below `n·σ_bg` are zeroed after background subtraction. The standard (§3.1) requires that negative values are retained so that positive and negative noise amplitudes cancel in the second-moment integral. Zeroing introduces a small negative bias in σ (beam appears narrower than it is). This is a known pragmatic deviation; its effect grows with background level and is most significant for beams smaller than 0.25× the sensor size.
 
-**2. Fine baseline correction (§3.4.2)**
-The standard's statistical method uses a 2D convolution (averaging over n×m pixel sub-arrays, Eq. 60) before identifying non-illuminated pixels, in order to avoid digitisation errors. The current implementation uses a direct corner-patch estimate (§3.4.3 approximation method) without the convolution step. This is sufficient for most practical cases and is explicitly permitted by the standard as a first approximation.
+**ISO statistical method (§3.4.2) — fully compliant**
+Negative values after background subtraction are retained as required by §3.1. The background is estimated using a 2D uniform filter (Eq. 60 of the standard) before identifying non-illuminated pixels, avoiding digitisation artefacts. This method is §3.1 compliant and is recommended for accurate measurements.
 
 ### Sources
 
@@ -224,7 +224,6 @@ python -m pytest beamprofiler/tests/ -v
 
 ## Known limitations and planned improvements
 
-- **Background correction** — current implementation deviates from ISO/TR 11146-3 §3.1 (see above). A fully standard-compliant statistical method (§3.4.2) is planned.
 - **No uncertainty estimates** — ISO/TR 11146-3 §5 noise propagation to σ values is not yet implemented.
 - **No M² measurement** — single-plane D4σ only; multi-z hyperbolic fit for M² is planned.
 - **No session save/load** — ROIs, damage masks, and settings are not persisted between sessions.
