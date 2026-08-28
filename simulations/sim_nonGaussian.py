@@ -29,7 +29,7 @@ import sys, numpy as np, pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-sys.path.insert(0, ".")
+sys.path.insert(0, "..")
 from beamprofiler.analysis import (iso_background_statistical,
                                     beam_size_iso, auto_roi)
 from scipy.special import j0
@@ -123,11 +123,13 @@ def make_tpa(I_norm, bg_adu, noise_std, rng):
 # ── Analysis ──────────────────────────────────────────────────────────────
 
 def analyse(img, use_tpa):
-    """Return sigma_x using ISO statistical BG, with or without TPA correction."""
+    """Return sigma_x using ISO statistical BG.
+    pad=5.0 for TPA corrected (raw I^2 has narrower auto-ROI estimate),
+    pad=3.0 for linear or TPA uncorrected."""
+    pad = 5.0 if use_tpa else 3.0
     bm, bs = iso_background_statistical(img, n_sigma=3.0)
     try:
-        if use_tpa: x0, x1, y0, y1 = auto_roi(img, pad_sigma=5.0)
-        else: x0, x1, y0, y1 = auto_roi(img, pad_sigma=3.0)
+        x0, x1, y0, y1 = auto_roi(img, pad_sigma=pad)
         roi = img[y0:y1, x0:x1].astype(float)
         m, _, _ = beam_size_iso(roi, px=1.0, bg_mean=bm, bg_std=bs,
                                  n_sigma=3.0, mask_factor=3.0,
@@ -186,7 +188,7 @@ beam_names = list(beams.keys())
 x = np.arange(len(beam_names))
 width = 0.25
 
-fig, ax = plt.subplots(figsize=(13, 6))
+fig, ax = plt.subplots(figsize=(6, 4))
 fig.patch.set_facecolor("white"); ax.set_facecolor("white")
 for sp in ax.spines.values():
     sp.set_edgecolor("#bbbbbb"); sp.set_linewidth(0.8)
@@ -216,7 +218,7 @@ ax.set_title(
     fontsize=11, fontweight="bold")
 ax.legend(fontsize=10, framealpha=0.95, edgecolor="#cccccc")
 plt.tight_layout()
-fig.savefig("sim_nonGaussian_profiles.png", dpi=150,
+fig.savefig(r"C:\Users\gyfan\PycharmProjects\MSc_project\MSc_notes\Images\sim_nonGaussian_profiles.pdf", dpi=150,
             bbox_inches="tight", facecolor="white")
 print("Saved sim_nonGaussian_profiles.png")
 
@@ -225,9 +227,9 @@ fig2, axes2 = plt.subplots(1, 5, figsize=(18, 4))
 fig2.patch.set_facecolor("white")
 for ax2, (name, fn) in zip(axes2, beams.items()):
     ax2.imshow(fn(N, W0), cmap="hot", origin="upper")
-    ax2.set_title(name, fontsize=9, fontweight="bold")
+    ax2.set_title(name, fontsize=16, fontweight="bold")
     ax2.axis("off")
 plt.tight_layout()
-fig2.savefig("sim_nonGaussian_beamprofiles.png", dpi=150,
+fig2.savefig(r"C:\Users\gyfan\PycharmProjects\MSc_project\MSc_notes\Images\sim_nonGaussian_beamprofiles.pdf", dpi=150,
              bbox_inches="tight", facecolor="white")
 print("Saved sim_nonGaussian_beamprofiles.png")

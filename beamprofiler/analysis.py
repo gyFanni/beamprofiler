@@ -136,6 +136,129 @@ def load_csv(path: str, has_header: bool, has_index: bool) -> np.ndarray:
     return pd.read_csv(path, header=header, index_col=index_col).values.astype(float)
 
 
+def load_tiff(path: str) -> dict:
+    """
+    Load a TIFF image file and return a dict with keys:
+        image     : np.ndarray (float64), shape (ny, nx)
+        bits      : int   -- bit depth detected from dtype or TIFF tags (8/12/14/16/32)
+        pixel_size_x : float or None  -- pixel pitch in mm if stored in TIFF XResolution tag
+        pixel_size_y : float or None
+
+    Supports 8, 12, 14, 16, and 32-bit TIFFs (grayscale only; for multi-frame
+    TIFFs the first frame is returned). Requires tifffile or Pillow; tifffile is
+    preferred because it preserves bit depth and metadata.
+
+    Raises ImportError if neither tifffile nor Pillow is installed.
+    Raises ValueError if the image is not 2D (e.g. RGB).
+    """
+    # ── try tifffile first (preserves bit depth, metadata) ─────────────────
+    try:
+        import tifffile
+        with tifffile.TiffFile(path) as tif:
+            # first page / first frame
+            arr = tif.pages[0].asarray()
+            if arr.ndim == 3:
+                # take first channel if shape is (1, ny, nx) or (ny, nx, 1)
+                if arr.shape[0] == 1:
+                    arr = arr[0]
+                elif arr.shape[2] == 1:
+                    arr = arr[:, :, 0]
+                else:
+                    raise ValueError(
+                        f"TIFF is RGB/multichannel ({arr.shape}) — load a "
+                        "grayscale image or convert first.")
+            if arr.ndim != 2:
+                raise ValueError(f"Expected 2D image, got shape {arr.shape}")
+
+            # bit depth from dtype
+            dtype = arr.dtype
+            if dtype == np.uint8:
+                bits = 8
+            elif dtype == np.uint16:
+                # could be 10/12/14-bit data stored in uint16 — inspect max value
+                max_val = int(arr.max())
+                if   max_val <= 4095:   bits = 12
+                elif max_val <= 16383:  bits = 14
+                else:                   bits = 16
+            elif dtype in (np.float32, np.float64):
+                bits = 32
+            else:
+                bits = int(dtype.itemsize * 8)
+
+            # pixel size from resolution tags (stored as pixels/unit)
+            px_x = px_y = None
+            page = tif.pages[0]
+            try:
+                res_unit = page.tags.get("ResolutionUnit")
+                x_res    = page.tags.get("XResolution")
+                y_res    = page.tags.get("YResolution")
+                if x_res and y_res:
+                    xr = x_res.value; yr = y_res.value
+                    # values can be int or (numerator, denominator) tuple
+                    xr = xr[0]/xr[1] if isinstance(xr, tuple) else float(xr)
+                    yr = yr[0]/yr[1] if isinstance(yr, tuple) else float(yr)
+                    unit = res_unit.value if res_unit else 1
+                    # unit: 1=undefined, 2=inch, 3=cm
+                    if unit == 2 and xr > 0:   # pixels/inch -> mm/pixel
+                        px_x = 25.4 / xr; px_y = 25.4 / yr
+                    elif unit == 3 and xr > 0: # pixels/cm -> mm/pixel
+                        px_x = 10.0 / xr; px_y = 10.0 / yr
+            except Exception:
+                pass
+
+            return dict(image=arr.astype(float), bits=bits,
+                        pixel_size_x=px_x, pixel_size_y=px_y)
+
+    except ImportError:
+        pass  # fall through to Pillow
+
+    # ── fallback: Pillow ────────────────────────────────────────────────────
+    try:
+        from PIL import Image
+        img_pil = Image.open(path)
+        arr = np.array(img_pil, dtype=float)
+        if arr.ndim == 3:
+            if arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            else:
+                raise ValueError(
+                    f"TIFF is RGB/multichannel ({arr.shape}) — load a "
+                    "grayscale image or convert first.")
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D image, got shape {arr.shape}")
+
+        max_val = int(arr.max())
+        if   max_val <= 255:    bits = 8
+        elif max_val <= 4095:   bits = 12
+        elif max_val <= 16383:  bits = 14
+        elif max_val <= 65535:  bits = 16
+        else:                   bits = 32
+
+        # Pillow XResolution is stored differently
+        px_x = px_y = None
+        try:
+            tag_info = img_pil.tag_v2 if hasattr(img_pil, "tag_v2") else {}
+            xr = tag_info.get(282); yr = tag_info.get(283)
+            unit = tag_info.get(296, 1)
+            if xr and yr:
+                xr = xr[0]/xr[1] if isinstance(xr, tuple) else float(xr)
+                yr = yr[0]/yr[1] if isinstance(yr, tuple) else float(yr)
+                if unit == 2 and xr > 0:
+                    px_x = 25.4/xr; px_y = 25.4/yr
+                elif unit == 3 and xr > 0:
+                    px_x = 10.0/xr; px_y = 10.0/yr
+        except Exception:
+            pass
+
+        return dict(image=arr, bits=bits, pixel_size_x=px_x, pixel_size_y=px_y)
+
+    except ImportError:
+        raise ImportError(
+            "Loading TIFF files requires either 'tifffile' or 'Pillow'.\n"
+            "Install with:  pip install tifffile\n"
+            "           or: pip install Pillow")
+
+
 def apply_sqrt(img: np.ndarray) -> np.ndarray:
     """TPA correction: sign(x)*sqrt(|x|)."""
     return np.sign(img) * np.sqrt(np.abs(img))
