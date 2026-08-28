@@ -216,7 +216,7 @@ ax.set_title(
 ax.set_xticks(SG_ORDERS)
 ax.legend(fontsize=10, framealpha=0.95, edgecolor="#cccccc")
 plt.tight_layout()
-fig.savefig(r"C:\Users\gyfan\PycharmProjects\MSc_project\MSc_notes\Images\sim_supergaussian_profiles.pdf", dpi=150,
+fig.savefig(r"sim_supergaussian_profiles.pdf", dpi=150,
             bbox_inches="tight", facecolor="white")
 print("Saved sim_supergaussian_profiles.png")
 

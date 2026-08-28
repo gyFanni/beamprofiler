@@ -218,7 +218,7 @@ ax.set_title(
     fontsize=11, fontweight="bold")
 ax.legend(fontsize=10, framealpha=0.95, edgecolor="#cccccc")
 plt.tight_layout()
-fig.savefig(r"C:\Users\gyfan\PycharmProjects\MSc_project\MSc_notes\Images\sim_nonGaussian_profiles.pdf", dpi=150,
+fig.savefig(r"sim_nonGaussian_profiles.pdf", dpi=150,
             bbox_inches="tight", facecolor="white")
 print("Saved sim_nonGaussian_profiles.png")
 
@@ -230,6 +230,6 @@ for ax2, (name, fn) in zip(axes2, beams.items()):
     ax2.set_title(name, fontsize=16, fontweight="bold")
     ax2.axis("off")
 plt.tight_layout()
-fig2.savefig(r"C:\Users\gyfan\PycharmProjects\MSc_project\MSc_notes\Images\sim_nonGaussian_beamprofiles.pdf", dpi=150,
+fig2.savefig(r"sim_nonGaussian_beamprofiles.pdf", dpi=150,
              bbox_inches="tight", facecolor="white")
 print("Saved sim_nonGaussian_beamprofiles.png")
