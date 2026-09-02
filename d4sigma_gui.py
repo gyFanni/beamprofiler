@@ -92,6 +92,7 @@ if _gui_dir not in _sys_pkg.path:
 from beamprofiler.models import FileEntry
 from beamprofiler.analysis import (
     load_csv,
+    load_tiff,
     apply_sqrt,
     check_saturation,
     iso_background,
@@ -861,8 +862,9 @@ class MainWindow(QMainWindow):
     def _on_add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Add image files", "",
-            "Image files (*.csv *.txt *.dat *.bgData *.bgdata);;"
+            "Image files (*.csv *.txt *.dat *.tif *.tiff *.bgData *.bgdata);;"
             "CSV files (*.csv *.txt *.dat);;"
+            "TIFF images (*.tif *.tiff);;"
             "BeamGage files (*.bgData *.bgdata);;"
             "All files (*)")
         if not paths:
@@ -904,12 +906,31 @@ class MainWindow(QMainWindow):
     def _load_image_file(self, path: str) -> tuple:
         """
         Load any supported image file. Returns (raw_array, metadata_dict).
-        metadata_dict is empty for CSV; contains pixel_size_x/bits/is_bgdata for .bgData.
+        metadata_dict is empty for CSV; contains pixel_size_x/bits/is_bgdata for .bgData;
+        contains bits/pixel_size_x/pixel_size_y for TIFF.
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in (".bgdata",):
             info = load_bgdata(path, frame=1)
             info["is_bgdata"] = True
+            return info["image"], info
+        elif ext in (".tif", ".tiff"):
+            info = load_tiff(path)
+            # auto-populate pixel size if stored in TIFF tags and not yet set
+            if info.get("pixel_size_x") is not None:
+                px_mm = info["pixel_size_x"]
+                px_um = px_mm * 1000
+                # only update if the spin box is still at the default
+                if abs(self.spin_px.value() - 5.0) < 0.01:
+                    self.spin_px.setValue(round(px_um, 4))
+                    self._status(f"Pixel size from TIFF metadata: {px_um:.4f} µm")
+            # auto-populate ADC ceiling from bit depth
+            bits = info.get("bits", None)
+            if bits and bits in (8, 10, 12, 14, 16):
+                adc_ceil = 2**bits - 1
+                if self.spin_vmax.value() == 255:   # still at 8-bit default
+                    self.spin_vmax.setValue(adc_ceil)
+                    self._status(f"ADC ceiling set to {adc_ceil} ({bits}-bit TIFF)")
             return info["image"], info
         else:
             raw = load_csv(path, self.chk_header.isChecked(),
@@ -1152,7 +1173,7 @@ class MainWindow(QMainWindow):
     def _on_load_dark(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open dark frame", "",
-            "Image files (*.csv *.txt *.dat *.bgData *.bgdata);;All files (*)")
+            "Image files (*.csv *.txt *.dat *.tif *.tiff *.bgData *.bgdata);;All files (*)")
         if not path: return
         try:
             dark, _ = self._load_image_file(path)
@@ -1769,6 +1790,7 @@ def _apply_stylesheet(app: QApplication) -> None:
 def main():
     app = QApplication(sys.argv)
     _apply_stylesheet(app)
+    app.setWindowIcon(QtGui.QIcon("icon.ico"))
 
     # Use a clean modern font if available
     from PyQt6.QtGui import QFont as _QFont

@@ -63,7 +63,7 @@ W0Y_W0X  = 0.8        # w0y / w0x ratio
 
 # Sweep
 BG_FRACTIONS = [0.01, 0.02, 0.05, 0.10]
-BEAM_SENSOR  = [0.10, 0.15, 0.20, 0.25]
+BEAM_SENSOR  = [0.10, 0.15, 0.20,0.25]
 BG_MODES     = ["off", "corner", "iso_statistical"]
 CAMERA_TYPES = ["linear", "tpa"]
 N_REAL       = 15     # noise realisations per condition
